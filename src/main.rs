@@ -89,7 +89,6 @@ struct App {
     last_mouse_pos: Option<(i32, i32)>,
     pending_edits: Vec<crate::sim::Edit>,
     screen_fitted: bool,
-    grid_sized: bool,
     show_quit_dialog: bool,
     last_mouse_move: Instant,
     cursor_hidden: bool,
@@ -149,7 +148,6 @@ impl App {
             last_mouse_pos: None,
             pending_edits: Vec::new(),
             screen_fitted: false,
-            grid_sized: false,
             show_quit_dialog: false,
             last_mouse_move: Instant::now(),
             cursor_hidden: false,
@@ -257,15 +255,17 @@ impl App {
     }
 
     fn resize_to_world(&mut self, _ctx: &egui::Context, rect: Rect) {
-        // Size the world exactly once to the initial screen resolution.
-        // After that, viewport changes only move the camera; the world state never resizes.
-        if !self.grid_sized {
-            let w = (rect.width().ceil() as u32).max(1);
-            let h = (rect.height().ceil() as u32).max(1);
+        // Keep the world grid the same size as the viewport so it always fills the
+        // screen with no border. The old state is copied into the center, and the
+        // camera shifts by the same offset so the view stays anchored to the content.
+        let w = (rect.width().ceil() as u32).max(1);
+        let h = (rect.height().ceil() as u32).max(1);
+        let (old_w, old_h) = self.sim.lock().unwrap().size;
+        if (old_w, old_h) != (w, h) {
+            let shift_x = ((w as i64 - old_w as i64) / 2) as f32;
+            let shift_y = ((h as i64 - old_h as i64) / 2) as f32;
+            self.center += egui::Vec2::new(shift_x, shift_y);
             self.sim.lock().unwrap().resize(w, h);
-            self.center = egui::Vec2::new(w as f32 * 0.5, h as f32 * 0.5);
-            self.scale = 1.0;
-            self.grid_sized = true;
         }
         self.clamp_camera(rect);
     }
