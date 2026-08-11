@@ -255,17 +255,21 @@ impl App {
     }
 
     fn resize_to_world(&mut self, _ctx: &egui::Context, rect: Rect) {
-        // Keep the world grid the same size as the viewport so it always fills the
-        // screen with no border. The old state is copied into the center, and the
-        // camera shifts by the same offset so the view stays anchored to the content.
+        // The world only ever grows, never shrinks, so existing content is never
+        // cropped. When the viewport is smaller than the world, the camera zooms
+        // out to fit (see clamp_camera's min_scale). When it's larger (e.g. going
+        // into fullscreen), the world grows to exactly fill the screen (no frame)
+        // and preserves the current cells by centering them in the new grid.
+        let (gw, gh) = self.sim.lock().unwrap().size;
         let w = (rect.width().ceil() as u32).max(1);
         let h = (rect.height().ceil() as u32).max(1);
-        let (old_w, old_h) = self.sim.lock().unwrap().size;
-        if (old_w, old_h) != (w, h) {
-            let shift_x = ((w as i64 - old_w as i64) / 2) as f32;
-            let shift_y = ((h as i64 - old_h as i64) / 2) as f32;
+        if w > gw || h > gh {
+            let nw = w.max(gw);
+            let nh = h.max(gh);
+            let shift_x = ((nw as i64 - gw as i64) / 2) as f32;
+            let shift_y = ((nh as i64 - gh as i64) / 2) as f32;
             self.center += egui::Vec2::new(shift_x, shift_y);
-            self.sim.lock().unwrap().resize(w, h);
+            self.sim.lock().unwrap().resize(nw, nh);
         }
         self.clamp_camera(rect);
     }
