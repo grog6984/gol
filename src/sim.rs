@@ -440,10 +440,19 @@ impl Sim {
         } else {
             &self.tex_b
         };
-        let offset_x = width.saturating_sub(old_w) / 2;
-        let offset_y = height.saturating_sub(old_h) / 2;
-        let copy_w = old_w.min(width);
-        let copy_h = old_h.min(height);
+        // Center the old content in the new grid on both grow and shrink. The
+        // offset is signed; the copy is clipped to the overlapping region so a
+        // negative offset (shrinking) crops from the source, not just the bottom-right.
+        let ox = (width as i32 - old_w as i32) / 2;
+        let oy = (height as i32 - old_h as i32) / 2;
+        let src_x = if ox < 0 { (-ox) as u32 } else { 0 };
+        let dst_x = if ox > 0 { ox as u32 } else { 0 };
+        let src_y = if oy < 0 { (-oy) as u32 } else { 0 };
+        let dst_y = if oy > 0 { oy as u32 } else { 0 };
+        let copy_w = (old_w as i32 - src_x as i32).max(0) as u32;
+        let copy_w = copy_w.min(width - dst_x);
+        let copy_h = (old_h as i32 - src_y as i32).max(0) as u32;
+        let copy_h = copy_h.min(height - dst_y);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -453,15 +462,19 @@ impl Sim {
             wgpu::TexelCopyTextureInfo {
                 texture: old_src,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: src_x,
+                    y: src_y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
                 texture: &tex_a,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
-                    x: offset_x,
-                    y: offset_y,
+                    x: dst_x,
+                    y: dst_y,
                     z: 0,
                 },
                 aspect: wgpu::TextureAspect::All,
