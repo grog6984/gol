@@ -368,6 +368,7 @@ impl eframe::App for App {
                     self.last_mouse_move = Instant::now();
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.fullscreen));
                 ctx.request_repaint();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
