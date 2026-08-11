@@ -16,6 +16,12 @@ use crate::script::{ScriptEngine, ScriptResult};
 use crate::sim::Sim;
 
 fn main() {
+    // Force X11 so fullscreen is truly borderless (Wayland often keeps a thin frame).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
+
     env_logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
