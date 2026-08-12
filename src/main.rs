@@ -96,7 +96,21 @@ struct App {
     selection: Option<[i32; 4]>,
     selection_start: Option<egui::Pos2>,
     selection_current: Option<egui::Pos2>,
+    selection_edge: Option<SelectionEdge>,
+    hovered_edge: Option<SelectionEdge>,
     export_status: Option<(String, Instant)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 const INITIAL_GRID: u32 = 1024;
@@ -159,6 +173,8 @@ impl App {
             selection: None,
             selection_start: None,
             selection_current: None,
+            selection_edge: None,
+            hovered_edge: None,
             export_status: None,
         };
         let initial = pattern_presets()[app.selected_pattern_idx].clone();
@@ -353,6 +369,83 @@ impl App {
         Some(egui::Rect::from_min_max(min, max))
     }
 
+    fn hover_selection_edge(&self, rect: Rect, pos: Option<egui::Pos2>) -> Option<SelectionEdge> {
+        let pos = pos?;
+        let sel = self.selection_screen_rect(rect)?;
+        let margin = 6.0;
+        let near_left = (pos.x - sel.left()).abs() < margin;
+        let near_right = (pos.x - sel.right()).abs() < margin;
+        let near_top = (pos.y - sel.top()).abs() < margin;
+        let near_bottom = (pos.y - sel.bottom()).abs() < margin;
+        let inside_x = pos.x >= sel.left() - margin && pos.x <= sel.right() + margin;
+        let inside_y = pos.y >= sel.top() - margin && pos.y <= sel.bottom() + margin;
+        if !inside_x || !inside_y {
+            return None;
+        }
+        match (near_top, near_bottom, near_left, near_right) {
+            (true, false, true, false) => Some(SelectionEdge::TopLeft),
+            (true, false, false, true) => Some(SelectionEdge::TopRight),
+            (false, true, true, false) => Some(SelectionEdge::BottomLeft),
+            (false, true, false, true) => Some(SelectionEdge::BottomRight),
+            (true, false, _, _) => Some(SelectionEdge::Top),
+            (false, true, _, _) => Some(SelectionEdge::Bottom),
+            (_, _, true, false) => Some(SelectionEdge::Left),
+            (_, _, false, true) => Some(SelectionEdge::Right),
+            _ => None,
+        }
+    }
+
+    fn edge_cursor(edge: SelectionEdge) -> egui::CursorIcon {
+        match edge {
+            SelectionEdge::Left | SelectionEdge::Right => egui::CursorIcon::ResizeHorizontal,
+            SelectionEdge::Top | SelectionEdge::Bottom => egui::CursorIcon::ResizeVertical,
+            SelectionEdge::TopLeft | SelectionEdge::BottomRight => {
+                egui::CursorIcon::ResizeNwSe
+            }
+            SelectionEdge::TopRight | SelectionEdge::BottomLeft => {
+                egui::CursorIcon::ResizeNeSw
+            }
+        }
+    }
+
+    fn resize_selection(&mut self, edge: SelectionEdge, rect: Rect, pos: egui::Pos2) {
+        let (cx, cy) = match self.cell_at(rect, pos) {
+            Some(p) => p,
+            None => return,
+        };
+        let Some(sel) = self.selection.as_mut() else { return };
+        match edge {
+            SelectionEdge::Left => sel[0] = cx.min(sel[2]),
+            SelectionEdge::Right => sel[2] = cx.max(sel[0]),
+            SelectionEdge::Top => sel[1] = cy.min(sel[3]),
+            SelectionEdge::Bottom => sel[3] = cy.max(sel[1]),
+            SelectionEdge::TopLeft => {
+                sel[0] = cx.min(sel[2]);
+                sel[1] = cy.min(sel[3]);
+            }
+            SelectionEdge::TopRight => {
+                sel[2] = cx.max(sel[0]);
+                sel[1] = cy.min(sel[3]);
+            }
+            SelectionEdge::BottomLeft => {
+                sel[0] = cx.min(sel[2]);
+                sel[3] = cy.max(sel[1]);
+            }
+            SelectionEdge::BottomRight => {
+                sel[2] = cx.max(sel[0]);
+                sel[3] = cy.max(sel[1]);
+            }
+        }
+    }
+
+    fn clear_selection_if_outside(&mut self, rect: Rect, pos: egui::Pos2) {
+        if let Some(sel) = self.selection_screen_rect(rect) {
+            if !sel.contains(pos) {
+                self.selection = None;
+            }
+        }
+    }
+
     fn clear_outside_selection(&mut self) {
         let Some(sel) = self.selection else { return };
         self.flush_edits();
@@ -420,10 +513,50 @@ impl App {
             painter.rect_filled(r, 1.0, accent);
             painter.rect_stroke(r, 1.0, handle_stroke, egui::StrokeKind::Outside);
         }
+
+        // Highlight the edge or corner being hovered or dragged for resizing.
+        if let Some(edge) = self.selection_edge.or(self.hovered_edge) {
+            let hi = egui::Stroke::new(2.5_f32, egui::Color32::WHITE);
+            let lt = screen_rect.left_top();
+            let rt = screen_rect.right_top();
+            let lb = screen_rect.left_bottom();
+            let rb = screen_rect.right_bottom();
+            match edge {
+                SelectionEdge::Left => {
+                    painter.line_segment([lt, lb], hi);
+                }
+                SelectionEdge::Right => {
+                    painter.line_segment([rt, rb], hi);
+                }
+                SelectionEdge::Top => {
+                    painter.line_segment([lt, rt], hi);
+                }
+                SelectionEdge::Bottom => {
+                    painter.line_segment([lb, rb], hi);
+                }
+                SelectionEdge::TopLeft => {
+                    painter.line_segment([lt, rt], hi);
+                    painter.line_segment([lt, lb], hi);
+                }
+                SelectionEdge::TopRight => {
+                    painter.line_segment([lt, rt], hi);
+                    painter.line_segment([rt, rb], hi);
+                }
+                SelectionEdge::BottomLeft => {
+                    painter.line_segment([lb, rb], hi);
+                    painter.line_segment([lt, lb], hi);
+                }
+                SelectionEdge::BottomRight => {
+                    painter.line_segment([lb, rb], hi);
+                    painter.line_segment([rt, rb], hi);
+                }
+            }
+        }
+
         if self.selection.is_some() {
             let cw = (screen_rect.width() / self.scale).round() as u64;
             let ch = (screen_rect.height() / self.scale).round() as u64;
-            let text = format!("{cw}×{ch}  ·  Y clear outside  ·  Ctrl+S export");
+            let text = format!("{cw}×{ch}  ·  Y clear  ·  Ctrl+S save  ·  drag edges  ·  Esc clear");
             let galley = painter.layout_no_wrap(
                 text,
                 egui::FontId::monospace(11.0),
@@ -532,10 +665,11 @@ impl eframe::App for App {
 
             // Selection editing shortcuts (paused only).
             if !self.running {
-                let (y_pressed, ctrl_s) = ctx.input(|i| {
+                let (y_pressed, ctrl_s, esc) = ctx.input(|i| {
                     (
                         i.key_pressed(egui::Key::Y) && !i.modifiers.command,
                         i.modifiers.command && i.key_pressed(egui::Key::S),
+                        i.key_pressed(egui::Key::Escape),
                     )
                 });
                 if y_pressed {
@@ -543,6 +677,12 @@ impl eframe::App for App {
                 }
                 if ctrl_s {
                     self.save_selection_png();
+                }
+                if esc {
+                    self.selection = None;
+                    self.selection_start = None;
+                    self.selection_current = None;
+                    self.selection_edge = None;
                 }
             }
 
@@ -750,7 +890,8 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label("Shortcuts: Space = run/pause  F1 = UI  F = fullscreen  1-5 = flip %");
                     ui.label("Up/Down = step count   Wheel = zoom   middle/right-drag = pan");
-                    ui.label("Left-click/drag = paint   Right-click = erase   Q = quit");
+                    ui.label("Ctrl+drag = select area   drag edges = resize   Y = clear outside");
+                    ui.label("Ctrl+S = export PNG   Esc/click outside = clear selection   Q = quit");
                 });
         }
 
@@ -809,9 +950,22 @@ impl eframe::App for App {
             // Editing only while paused.
             if !self.running {
                 let ctrl = ctx.input(|i| i.modifiers.command);
+
+                // Show resize cursor when hovering a selection edge.
+                if !ctrl && self.selection.is_some() && self.selection_edge.is_none() {
+                    self.hovered_edge = self.hover_selection_edge(rect, response.hover_pos());
+                    if let Some(edge) = self.hovered_edge {
+                        ctx.output_mut(|o| o.cursor_icon = Self::edge_cursor(edge));
+                    }
+                } else {
+                    self.hovered_edge = None;
+                }
+
                 if ctrl {
-                    // Ctrl+drag draws a rectangular selection; Ctrl+click clears it.
+                    // Ctrl+drag starts a fresh rectangular selection; Ctrl+click clears it.
+                    self.selection_edge = None;
                     if response.drag_started_by(egui::PointerButton::Primary) {
+                        self.selection = None;
                         self.selection_start = response.interact_pointer_pos();
                         self.selection_current = response.interact_pointer_pos();
                     } else if response.dragged_by(egui::PointerButton::Primary) {
@@ -824,9 +978,23 @@ impl eframe::App for App {
                         self.selection_start = None;
                         self.selection_current = None;
                     }
+                } else if let Some(edge) = self.selection_edge {
+                    // Dragging a selection edge resizes it.
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            self.resize_selection(edge, rect, pos);
+                        }
+                    } else if response.drag_stopped() {
+                        self.selection_edge = None;
+                    }
+                } else if let Some(edge) = self.hovered_edge {
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        self.selection_edge = Some(edge);
+                    }
                 } else if response.drag_started_by(egui::PointerButton::Primary) {
                     self.drawing = true;
                     if let Some(pos) = response.interact_pointer_pos() {
+                        self.clear_selection_if_outside(rect, pos);
                         if let Some((x, y)) = self.cell_at(rect, pos) {
                             self.paint_at(x, y, false);
                             self.last_mouse_pos = Some((x, y));
@@ -851,9 +1019,10 @@ impl eframe::App for App {
                     self.flush_edits();
                 }
 
-                // Right-click erases a single cell.
+                // Right-click erases a single cell (and clears selection if clicked outside it).
                 if response.clicked_by(egui::PointerButton::Secondary) {
                     if let Some(pos) = response.interact_pointer_pos() {
+                        self.clear_selection_if_outside(rect, pos);
                         if let Some((x, y)) = self.cell_at(rect, pos) {
                             self.paint_at(x, y, true);
                             self.flush_edits();
@@ -861,9 +1030,10 @@ impl eframe::App for App {
                     }
                 }
 
-                // Left-click paints a single cell.
+                // Left-click paints a single cell (and clears selection if clicked outside it).
                 if response.clicked_by(egui::PointerButton::Primary) && !self.drawing && !ctrl {
                     if let Some(pos) = response.interact_pointer_pos() {
+                        self.clear_selection_if_outside(rect, pos);
                         if let Some((x, y)) = self.cell_at(rect, pos) {
                             self.paint_at(x, y, false);
                             self.flush_edits();
@@ -921,6 +1091,7 @@ impl eframe::App for App {
             || self.sim.lock().unwrap().has_pending_readback()
             || self.sim.lock().unwrap().png_readback.is_some()
             || self.selection_start.is_some()
+            || self.selection_edge.is_some()
         {
             ctx.request_repaint();
         }
