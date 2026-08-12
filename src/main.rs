@@ -98,6 +98,7 @@ struct App {
     selection_current: Option<egui::Pos2>,
     selection_edge: Option<SelectionEdge>,
     hovered_edge: Option<SelectionEdge>,
+    world_rect: Rect,
     export_status: Option<(String, Instant)>,
 }
 
@@ -175,6 +176,7 @@ impl App {
             selection_current: None,
             selection_edge: None,
             hovered_edge: None,
+            world_rect: Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)),
             export_status: None,
         };
         let initial = pattern_presets()[app.selected_pattern_idx].clone();
@@ -462,13 +464,16 @@ impl App {
     }
 
     fn save_selection_png(&mut self) {
-        let Some(sel) = self.selection else { return };
         self.flush_edits();
         let (w, h) = self.sim.lock().unwrap().size;
-        let x0 = sel[0].clamp(0, w as i32 - 1) as u32;
-        let y0 = sel[1].clamp(0, h as i32 - 1) as u32;
-        let x1 = sel[2].clamp(0, w as i32 - 1) as u32;
-        let y1 = sel[3].clamp(0, h as i32 - 1) as u32;
+        let (x0, y0, x1, y1) = match self.selection {
+            Some(sel) => (sel[0], sel[1], sel[2], sel[3]),
+            None => self.visible_cells(self.world_rect),
+        };
+        let x0 = x0.clamp(0, w as i32 - 1) as u32;
+        let y0 = y0.clamp(0, h as i32 - 1) as u32;
+        let x1 = x1.clamp(0, w as i32 - 1) as u32;
+        let y1 = y1.clamp(0, h as i32 - 1) as u32;
         if x1 < x0 || y1 < y0 {
             return;
         }
@@ -480,7 +485,31 @@ impl App {
         let path = next_download_path();
         let palette = sim.palette.clone();
         sim.request_selection_png(x0, y0, x1, y1, path.clone(), palette);
-        self.export_status = Some(("Saving selection…".to_string(), Instant::now()));
+        let label = if self.selection.is_some() {
+            "Saving selection…".to_string()
+        } else {
+            "Saving viewport…".to_string()
+        };
+        self.export_status = Some((label, Instant::now()));
+    }
+
+    fn visible_cells(&self, rect: Rect) -> (i32, i32, i32, i32) {
+        let (w, h) = self.sim.lock().unwrap().size;
+        let vp = rect.size() * 0.5;
+        let world = |pos: egui::Pos2| -> (f32, f32) {
+            let rel = pos - rect.min;
+            (
+                self.center.x + (rel.x - vp.x) / self.scale,
+                self.center.y + (rel.y - vp.y) / self.scale,
+            )
+        };
+        let (ax, ay) = world(rect.left_top());
+        let (bx, by) = world(rect.right_bottom());
+        let x0 = (ax.floor() as i32).clamp(0, w as i32 - 1);
+        let y0 = (ay.floor() as i32).clamp(0, h as i32 - 1);
+        let x1 = (bx.floor() as i32).clamp(0, w as i32 - 1);
+        let y1 = (by.floor() as i32).clamp(0, h as i32 - 1);
+        (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
     }
 
     fn draw_selection(&self, ui: &egui::Ui, rect: Rect) {
@@ -891,7 +920,7 @@ impl eframe::App for App {
                     ui.label("Shortcuts: Space = run/pause  F1 = UI  F = fullscreen  1-5 = flip %");
                     ui.label("Up/Down = step count   Wheel = zoom   middle/right-drag = pan");
                     ui.label("Ctrl+drag = select area   drag edges = resize   Y = clear outside");
-                    ui.label("Ctrl+S = export PNG   Esc/click outside = clear selection   Q = quit");
+                    ui.label("Ctrl+S = export (selection or fullscreen)   Esc/click outside = clear selection   Q = quit");
                 });
         }
 
@@ -919,6 +948,7 @@ impl eframe::App for App {
             // global inner_rect here offsets everything by the window position,
             // which broke the moat and the selection mapping in windowed mode.
             let rect = ui.available_rect_before_wrap();
+            self.world_rect = rect;
             let ppp = ctx.pixels_per_point();
             self.resize_to_world(ctx, rect);
             self.clamp_camera(rect);
@@ -980,17 +1010,21 @@ impl eframe::App for App {
                     }
                 } else if let Some(edge) = self.selection_edge {
                     // Dragging a selection edge resizes it.
-                    if response.dragged_by(egui::PointerButton::Primary) {
+                    if !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {
+                        self.selection_edge = None;
+                    } else if response.dragged_by(egui::PointerButton::Primary) {
                         if let Some(pos) = response.interact_pointer_pos() {
                             self.resize_selection(edge, rect, pos);
                         }
-                    } else if response.drag_stopped() {
-                        self.selection_edge = None;
                     }
-                } else if let Some(edge) = self.hovered_edge {
-                    if response.drag_started_by(egui::PointerButton::Primary) {
-                        self.selection_edge = Some(edge);
-                    }
+                } else if response.is_pointer_button_down_on()
+                    && self.hovered_edge.is_some()
+                    && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                {
+                    // Start resizing as soon as the edge is pressed. The drag
+                    // threshold would otherwise move the pointer out of the hover
+                    // margin before `drag_started_by` fires.
+                    self.selection_edge = self.hovered_edge;
                 } else if response.drag_started_by(egui::PointerButton::Primary) {
                     self.drawing = true;
                     if let Some(pos) = response.interact_pointer_pos() {
