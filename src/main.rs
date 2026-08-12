@@ -92,6 +92,11 @@ struct App {
     show_quit_dialog: bool,
     last_mouse_move: Instant,
     cursor_hidden: bool,
+
+    selection: Option<[i32; 4]>,
+    selection_start: Option<egui::Pos2>,
+    selection_current: Option<egui::Pos2>,
+    export_status: Option<(String, Instant)>,
 }
 
 const INITIAL_GRID: u32 = 1024;
@@ -151,6 +156,10 @@ impl App {
             show_quit_dialog: false,
             last_mouse_move: Instant::now(),
             cursor_hidden: false,
+            selection: None,
+            selection_start: None,
+            selection_current: None,
+            export_status: None,
         };
         let initial = pattern_presets()[app.selected_pattern_idx].clone();
         app.reset_to_pattern(&initial);
@@ -311,6 +320,127 @@ impl App {
         self.sim.lock().unwrap().submit(vec![cb]);
     }
 
+    fn world_to_screen(&self, rect: Rect, gx: f32, gy: f32) -> egui::Pos2 {
+        let vp = rect.size() * 0.5;
+        egui::pos2(
+            rect.min.x + (gx - self.center.x) * self.scale + vp.x,
+            rect.min.y + (gy - self.center.y) * self.scale + vp.y,
+        )
+    }
+
+    fn finish_selection(&mut self, rect: Rect) {
+        if let (Some(a), Some(b)) = (self.selection_start, self.selection_current) {
+            if let (Some((ax, ay)), Some((bx, by))) = (self.cell_at(rect, a), self.cell_at(rect, b))
+            {
+                self.selection = Some([
+                    ax.min(bx),
+                    ay.min(by),
+                    ax.max(bx),
+                    ay.max(by),
+                ]);
+            } else {
+                self.selection = None;
+            }
+        }
+        self.selection_start = None;
+        self.selection_current = None;
+    }
+
+    fn selection_screen_rect(&self, rect: Rect) -> Option<egui::Rect> {
+        let sel = self.selection?;
+        let min = self.world_to_screen(rect, sel[0] as f32, sel[1] as f32);
+        let max = self.world_to_screen(rect, sel[2] as f32 + 1.0, sel[3] as f32 + 1.0);
+        Some(egui::Rect::from_min_max(min, max))
+    }
+
+    fn clear_outside_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.flush_edits();
+        let (w, h) = self.sim.lock().unwrap().size;
+        let x0 = sel[0].clamp(0, w as i32 - 1) as u32;
+        let y0 = sel[1].clamp(0, h as i32 - 1) as u32;
+        let x1 = sel[2].clamp(0, w as i32 - 1) as u32;
+        let y1 = sel[3].clamp(0, h as i32 - 1) as u32;
+        if x1 < x0 || y1 < y0 {
+            return;
+        }
+        let cb = self.sim.lock().unwrap().clear_outside(x0, y0, x1, y1);
+        self.sim.lock().unwrap().submit(vec![cb]);
+    }
+
+    fn save_selection_png(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.flush_edits();
+        let (w, h) = self.sim.lock().unwrap().size;
+        let x0 = sel[0].clamp(0, w as i32 - 1) as u32;
+        let y0 = sel[1].clamp(0, h as i32 - 1) as u32;
+        let x1 = sel[2].clamp(0, w as i32 - 1) as u32;
+        let y1 = sel[3].clamp(0, h as i32 - 1) as u32;
+        if x1 < x0 || y1 < y0 {
+            return;
+        }
+        let mut sim = self.sim.lock().unwrap();
+        if sim.png_readback.is_some() {
+            self.export_status = Some(("Export already in progress".to_string(), Instant::now()));
+            return;
+        }
+        let path = next_download_path();
+        let palette = sim.palette.clone();
+        sim.request_selection_png(x0, y0, x1, y1, path.clone(), palette);
+        self.export_status = Some(("Saving selection…".to_string(), Instant::now()));
+    }
+
+    fn draw_selection(&self, ui: &egui::Ui, rect: Rect) {
+        let accent = egui::Color32::from_rgb(70, 160, 255);
+        let screen_rect = match (
+            self.selection_current,
+            self.selection_start,
+            self.selection,
+        ) {
+            (Some(cur), Some(start), _) => egui::Rect::from_two_pos(start, cur),
+            (None, None, Some(_)) => match self.selection_screen_rect(rect) {
+                Some(r) => r,
+                None => return,
+            },
+            _ => return,
+        };
+        let painter = ui.painter();
+        painter.rect_filled(screen_rect, 2.0, accent.gamma_multiply(0.10));
+        let stroke = egui::Stroke::new(1.5_f32, accent);
+        painter.rect_stroke(screen_rect, 2.0, stroke, egui::StrokeKind::Outside);
+        let handle = 6.0;
+        let handle_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        for corner in [
+            screen_rect.left_top(),
+            screen_rect.right_top(),
+            screen_rect.left_bottom(),
+            screen_rect.right_bottom(),
+        ] {
+            let r = egui::Rect::from_center_size(corner, egui::Vec2::splat(handle));
+            painter.rect_filled(r, 1.0, accent);
+            painter.rect_stroke(r, 1.0, handle_stroke, egui::StrokeKind::Outside);
+        }
+        if self.selection.is_some() {
+            let cw = (screen_rect.width() / self.scale).round() as u64;
+            let ch = (screen_rect.height() / self.scale).round() as u64;
+            let text = format!("{cw}×{ch}  ·  Y clear outside  ·  Ctrl+S export");
+            let galley = painter.layout_no_wrap(
+                text,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgb(235, 235, 235),
+            );
+            let mut bg = screen_rect.left_top() - egui::vec2(0.0, galley.size().y + 6.0);
+            bg.x = bg.x.clamp(rect.left(), rect.right() - galley.size().x);
+            bg.y = bg.y.max(rect.top());
+            painter.rect_filled(
+                egui::Rect::from_min_size(bg, galley.size() + egui::vec2(8.0, 4.0)),
+                3.0,
+                egui::Color32::from_black_alpha(190),
+            );
+            painter.galley(bg + egui::vec2(4.0, 2.0), galley, egui::Color32::WHITE);
+        }
+    }
+
     fn reset_to_pattern(&mut self, pat: &Pattern) {
         self.clear();
         {
@@ -398,6 +528,41 @@ impl eframe::App for App {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 self.steps_per_frame = (self.steps_per_frame.saturating_sub(1)).max(1);
+            }
+
+            // Selection editing shortcuts (paused only).
+            if !self.running {
+                let (y_pressed, ctrl_s) = ctx.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Y) && !i.modifiers.command,
+                        i.modifiers.command && i.key_pressed(egui::Key::S),
+                    )
+                });
+                if y_pressed {
+                    self.clear_outside_selection();
+                }
+                if ctrl_s {
+                    self.save_selection_png();
+                }
+            }
+
+            // Finish any pending PNG export.
+            if let Some(result) = self.sim.lock().unwrap().poll_png() {
+                match result {
+                    Ok(path) => {
+                        self.export_status =
+                            Some((format!("Saved {}", path.display()), Instant::now()));
+                        if let Some(name) = path.file_name() {
+                            if let Some(name) = name.to_str() {
+                                println!("{name}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.export_status =
+                            Some((format!("Export failed: {e}"), Instant::now()));
+                    }
+                }
             }
         }
 
@@ -645,7 +810,23 @@ impl eframe::App for App {
 
             // Editing only while paused.
             if !self.running {
-                if response.drag_started_by(egui::PointerButton::Primary) {
+                let ctrl = ctx.input(|i| i.modifiers.command);
+                if ctrl {
+                    // Ctrl+drag draws a rectangular selection; Ctrl+click clears it.
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        self.selection_start = response.interact_pointer_pos();
+                        self.selection_current = response.interact_pointer_pos();
+                    } else if response.dragged_by(egui::PointerButton::Primary) {
+                        self.selection_current = response.interact_pointer_pos();
+                    } else if response.drag_stopped() {
+                        self.finish_selection(rect);
+                    }
+                    if response.clicked_by(egui::PointerButton::Primary) {
+                        self.selection = None;
+                        self.selection_start = None;
+                        self.selection_current = None;
+                    }
+                } else if response.drag_started_by(egui::PointerButton::Primary) {
                     self.drawing = true;
                     if let Some(pos) = response.interact_pointer_pos() {
                         if let Some((x, y)) = self.cell_at(rect, pos) {
@@ -683,7 +864,7 @@ impl eframe::App for App {
                 }
 
                 // Left-click paints a single cell.
-                if response.clicked_by(egui::PointerButton::Primary) && !self.drawing {
+                if response.clicked_by(egui::PointerButton::Primary) && !self.drawing && !ctrl {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if let Some((x, y)) = self.cell_at(rect, pos) {
                             self.paint_at(x, y, false);
@@ -703,11 +884,45 @@ impl eframe::App for App {
             self.flush_edits();
             let callback = eframe::egui_wgpu::Callback::new_paint_callback(rect, cb);
             ui.painter().add(callback);
+
+            // Selection overlay (paused only).
+            if !self.running && (self.selection.is_some() || self.selection_start.is_some()) {
+                self.draw_selection(ui, rect);
+            }
+
+            // Transient export status message.
+            if let Some((msg, at)) = &self.export_status {
+                if at.elapsed() < Duration::from_secs(4) {
+                    let painter = ui.painter();
+                    let galley = painter.layout_no_wrap(
+                        msg.clone(),
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::from_rgb(200, 235, 255),
+                    );
+                    let pos = egui::pos2(
+                        rect.center().x - galley.size().x * 0.5,
+                        rect.bottom() - 42.0,
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            pos - egui::vec2(10.0, 6.0),
+                            galley.size() + egui::vec2(20.0, 12.0),
+                        ),
+                        4.0,
+                        egui::Color32::from_black_alpha(200),
+                    );
+                    painter.galley(pos - egui::vec2(4.0, 0.0), galley, egui::Color32::WHITE);
+                } else {
+                    self.export_status = None;
+                }
+            }
         });
 
         if self.running
             || self.drawing
             || self.sim.lock().unwrap().has_pending_readback()
+            || self.sim.lock().unwrap().png_readback.is_some()
+            || self.selection_start.is_some()
         {
             ctx.request_repaint();
         }
@@ -747,6 +962,21 @@ impl eframe::egui_wgpu::CallbackTrait for GolCallback {
     ) {
         self.sim.lock().unwrap().render(render_pass);
     }
+}
+
+fn next_download_path() -> std::path::PathBuf {
+    let mut dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.push("Downloads");
+    std::fs::create_dir_all(&dir).ok();
+    for n in 1.. {
+        let p = dir.join(format!("gol_img_{n}.png"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    unreachable!()
 }
 
 fn line_cells(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {

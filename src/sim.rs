@@ -1,5 +1,6 @@
 use crate::palette::{self, Palette};
 use crate::rules::Rule;
+use egui::Color32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::util::DeviceExt;
@@ -27,10 +28,12 @@ pub struct Sim {
     render_bind_group_layout: wgpu::BindGroupLayout,
     edit_bind_group_layout: wgpu::BindGroupLayout,
     random_bind_group_layout: wgpu::BindGroupLayout,
+    clear_bind_group_layout: wgpu::BindGroupLayout,
     compute_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::RenderPipeline,
     edit_pipeline: wgpu::ComputePipeline,
     random_pipeline: wgpu::ComputePipeline,
+    clear_pipeline: wgpu::ComputePipeline,
 
     compute_bg_ab: wgpu::BindGroup,
     compute_bg_ba: wgpu::BindGroup,
@@ -41,14 +44,29 @@ pub struct Sim {
     pub rule: Rule,
     pub wrap: bool,
 
+    pub palette: Palette,
+
     readback: Option<Readback>,
     pub last_population: u32,
+
+    pub png_readback: Option<PngReadback>,
 }
 
 #[allow(dead_code)]
 struct Readback {
     buffer: wgpu::Buffer,
     mapped: Arc<AtomicBool>,
+}
+
+/// A pending GPU->CPU snapshot of a selected region, saved to PNG once mapped.
+pub struct PngReadback {
+    buffer: wgpu::Buffer,
+    mapped: Arc<AtomicBool>,
+    width: u32,
+    height: u32,
+    padded_row: u32,
+    path: std::path::PathBuf,
+    palette: Palette,
 }
 
 impl Sim {
@@ -222,13 +240,39 @@ impl Sim {
                 ],
             });
 
+        let clear_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("clear_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute_pipeline_layout"),
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[],
-            });
-        let edit_pipeline_layout =
+            });        let edit_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("edit_pipeline_layout"),
                 bind_group_layouts: &[&edit_bind_group_layout],
@@ -238,6 +282,12 @@ impl Sim {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("random_pipeline_layout"),
                 bind_group_layouts: &[&random_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let clear_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("clear_pipeline_layout"),
+                bind_group_layouts: &[&clear_bind_group_layout],
                 push_constant_ranges: &[],
             });
         let render_pipeline_layout =
@@ -258,6 +308,10 @@ impl Sim {
         let random_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("random_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/random.wgsl").into()),
+        });
+        let clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("clear_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/clear_outside.wgsl").into()),
         });
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render_shader"),
@@ -284,6 +338,14 @@ impl Sim {
             label: Some("random_pipeline"),
             layout: Some(&random_pipeline_layout),
             module: &random_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("clear_pipeline"),
+            layout: Some(&clear_pipeline_layout),
+            module: &clear_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
@@ -374,10 +436,12 @@ impl Sim {
             render_bind_group_layout,
             edit_bind_group_layout,
             random_bind_group_layout,
+            clear_bind_group_layout,
             compute_pipeline,
             render_pipeline,
             edit_pipeline,
             random_pipeline,
+            clear_pipeline,
             compute_bg_ab,
             compute_bg_ba,
             render_bg_a,
@@ -385,8 +449,10 @@ impl Sim {
             cpu_state,
             rule,
             wrap: true,
+            palette: palette.clone(),
             readback: None,
             last_population: 0,
+            png_readback: None,
         }
     }
 
@@ -547,6 +613,7 @@ impl Sim {
     }
 
     pub fn set_palette(&mut self, palette: &Palette) {
+        self.palette = palette.clone();
         let mut data = vec![0u8; palette::PALETTE_SIZE * 4];
         palette.build_rgba8(&mut data);
         self.queue.write_texture(
@@ -774,6 +841,151 @@ impl Sim {
         encoder.finish()
     }
 
+    /// Clear every cell outside the inclusive selection rect back to dead.
+    pub fn clear_outside(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> wgpu::CommandBuffer {
+        let (w, h) = self.size;
+        let params = ClearParams {
+            x0,
+            y0,
+            x1,
+            y1,
+            grid_w: w,
+            grid_h: h,
+        };
+        let param_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("clear_param_buffer"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let target = if self.current_is_a {
+            &self.view_a
+        } else {
+            &self.view_b
+        };
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("clear_bind_group"),
+            layout: &self.clear_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(target),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: param_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("clear_encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clear_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.clear_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((w + 15) / 16, (h + 15) / 16, 1);
+        }
+        encoder.finish()
+    }
+
+    /// Copy the selected region to a readback buffer; the PNG is written from
+    /// `poll_png` once the buffer has been mapped.
+    pub fn request_selection_png(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        path: std::path::PathBuf,
+        palette: Palette,
+    ) {
+        if self.png_readback.is_some() {
+            return;
+        }
+        let width = x1 - x0 + 1;
+        let height = y1 - y0 + 1;
+        let row_bytes = (width * 4) as u64;
+        let padded_row = ((row_bytes + 255) / 256) * 256;
+        let buffer_size = padded_row * (height as u64);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("png_readback_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let src = if self.current_is_a {
+            &self.tex_a
+        } else {
+            &self.tex_b
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("png_readback_encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: src,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: x0,
+                    y: y0,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let mapped = Arc::new(AtomicBool::new(false));
+        let mapped_cb = Arc::clone(&mapped);
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |_result| {
+                mapped_cb.store(true, Ordering::Relaxed);
+            });
+        self.png_readback = Some(PngReadback {
+            buffer,
+            mapped,
+            width,
+            height,
+            padded_row: padded_row as u32,
+            path,
+            palette,
+        });
+    }
+
+    /// Returns the saved path if a pending PNG readback completed.
+    pub fn poll_png(&mut self) -> Option<Result<std::path::PathBuf, String>> {
+        let rb = self.png_readback.take()?;
+        self.device.poll(wgpu::Maintain::Poll);
+        if !rb.mapped.load(Ordering::Relaxed) {
+            self.png_readback = Some(rb);
+            return None;
+        }
+        let result = write_png_from_readback(&rb);
+        Some(result)
+    }
+
     /// Draw the current state into the given render pass.
     pub fn render(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.set_pipeline(&self.render_pipeline);
@@ -875,12 +1087,59 @@ impl Sim {
     }
 }
 
+fn age_to_color(age: u32, palette: &Palette) -> Color32 {
+    if age == 0 {
+        return palette.sample(0.0);
+    }
+    // Same aging curve as render.wgsl: fresh cells use the palette's right end.
+    let n = age.ilog2() as f32;
+    let t = (1.0 - n * 0.08).clamp(0.0, 1.0);
+    palette.sample(t)
+}
+
+fn write_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(rgba).map_err(|e| e.to_string())
+}
+
+fn write_png_from_readback(rb: &PngReadback) -> Result<std::path::PathBuf, String> {
+    let view = rb.buffer.slice(..).get_mapped_range();
+    let data: &[u32] = bytemuck::cast_slice(&view);
+    let w = rb.width as usize;
+    let h = rb.height as usize;
+    let padded_u32s = (rb.padded_row / 4) as usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let age = data[y * padded_u32s + x];
+            let c = age_to_color(age, &rb.palette);
+            let o = (y * w + x) * 4;
+            rgba[o] = c.r();
+            rgba[o + 1] = c.g();
+            rgba[o + 2] = c.b();
+            rgba[o + 3] = c.a();
+        }
+    }
+    drop(view);
+    rb.buffer.unmap();
+    write_png(&rb.path, w as u32, h as u32, &rgba)?;
+    Ok(rb.path.clone())
+}
+
 fn create_state_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+) -> (wgpu::Texture, wgpu::TextureView) {    let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("state_texture"),
         size: wgpu::Extent3d {
             width,
@@ -1029,6 +1288,17 @@ struct RandomParams {
     grid_x: u32,
     grid_y: u32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ClearParams {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    grid_w: u32,
+    grid_h: u32,
 }
 
 #[repr(C)]
