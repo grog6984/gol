@@ -92,7 +92,6 @@ struct App {
     show_quit_dialog: bool,
     last_mouse_move: Instant,
     cursor_hidden: bool,
-    windowed_size: egui::Vec2,
 }
 
 const INITIAL_GRID: u32 = 1024;
@@ -152,7 +151,6 @@ impl App {
             show_quit_dialog: false,
             last_mouse_move: Instant::now(),
             cursor_hidden: false,
-            windowed_size: egui::vec2(1280.0, 800.0),
         };
         let initial = pattern_presets()[app.selected_pattern_idx].clone();
         app.reset_to_pattern(&initial);
@@ -372,25 +370,12 @@ impl eframe::App for App {
                 if self.fullscreen {
                     self.show_ui = false;
                     self.last_mouse_move = Instant::now();
-                    // Remember the current window size so we can restore it on exit.
-                    if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
-                        self.windowed_size = r.size();
-                    }
-                    // Manual borderless fullscreen: instead of relying on the WM's
-                    // fullscreen hint (which some compositors still frame), strip
-                    // decorations and size/position the window to cover the whole
-                    // monitor edge-to-edge.
-                    let size = ctx
-                        .input(|i| i.viewport().monitor_size)
-                        .unwrap_or_else(|| ctx.input(|i| i.screen_rect().size()));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.windowed_size));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                 }
+                // Use the WM fullscreen hint so the window covers the monitor and
+                // the desktop panels are hidden; decorations are removed by
+                // fullscreen. Combined with the grow-only world (which fills the
+                // screen exactly) this gives a borderless, edge-to-edge view.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                 ctx.request_repaint();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
