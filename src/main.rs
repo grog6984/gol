@@ -773,13 +773,11 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Use the native window content rect (in points) as the source of truth
-            // so the world always reaches the true window edge. `available_rect` can
-            // be a fraction of a point shy of the surface, which leaves a thin gray
-            // panel strip around the world in fullscreen.
-            let rect = ctx
-                .input(|i| i.viewport().inner_rect)
-                .unwrap_or_else(|| ui.available_rect_before_wrap());
+            // Panel-local coordinates (origin at the window's top-left) so the
+            // world matches egui's pointer/painting space exactly. Using the
+            // global inner_rect here offsets everything by the window position,
+            // which broke the moat and the selection mapping in windowed mode.
+            let rect = ui.available_rect_before_wrap();
             let ppp = ctx.pixels_per_point();
             self.resize_to_world(ctx, rect);
             self.clamp_camera(rect);
