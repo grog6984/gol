@@ -34,6 +34,7 @@ pub struct Sim {
     edit_pipeline: wgpu::ComputePipeline,
     random_pipeline: wgpu::ComputePipeline,
     clear_pipeline: wgpu::ComputePipeline,
+    clear_inside_pipeline: wgpu::ComputePipeline,
 
     compute_bg_ab: wgpu::BindGroup,
     compute_bg_ba: wgpu::BindGroup,
@@ -58,14 +59,27 @@ struct Readback {
     mapped: Arc<AtomicBool>,
 }
 
-/// A pending GPU->CPU snapshot of a selected region, saved to PNG once mapped.
+/// The outcome of a finished GPU->CPU region readback.
+pub enum ReadbackResult {
+    /// Written to a PNG file on disk.
+    Saved(std::path::PathBuf),
+    /// Raw RGBA8 pixels, e.g. for the system clipboard.
+    Image {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+}
+
+/// A pending GPU->CPU snapshot of a selected region. When the `path` is set the
+/// result is saved as a PNG; otherwise the raw RGBA pixels are returned instead.
 pub struct PngReadback {
     buffer: wgpu::Buffer,
     mapped: Arc<AtomicBool>,
     width: u32,
     height: u32,
     padded_row: u32,
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
     palette: Palette,
 }
 
@@ -350,6 +364,18 @@ impl Sim {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let clear_inside_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("clear_inside_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/clear_inside.wgsl").into()),
+        });
+        let clear_inside_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("clear_inside_pipeline"),
+            layout: Some(&clear_pipeline_layout),
+            module: &clear_inside_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("render_pipeline"),
@@ -442,6 +468,7 @@ impl Sim {
             edit_pipeline,
             random_pipeline,
             clear_pipeline,
+            clear_inside_pipeline,
             compute_bg_ab,
             compute_bg_ba,
             render_bg_a,
@@ -843,6 +870,24 @@ impl Sim {
 
     /// Clear every cell outside the inclusive selection rect back to dead.
     pub fn clear_outside(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> wgpu::CommandBuffer {
+        let pipeline = self.clear_pipeline.clone();
+        self.clear_rect(x0, y0, x1, y1, &pipeline)
+    }
+
+    /// Clear every cell inside the inclusive selection rect back to dead.
+    pub fn clear_inside(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> wgpu::CommandBuffer {
+        let pipeline = self.clear_inside_pipeline.clone();
+        self.clear_rect(x0, y0, x1, y1, &pipeline)
+    }
+
+    fn clear_rect(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        pipeline: &wgpu::ComputePipeline,
+    ) -> wgpu::CommandBuffer {
         let (w, h) = self.size;
         let params = ClearParams {
             x0,
@@ -864,20 +909,12 @@ impl Sim {
         } else {
             &self.view_b
         };
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clear_bind_group"),
-            layout: &self.clear_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(target),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: param_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = make_clear_bind_group(
+            &self.device,
+            &self.clear_bind_group_layout,
+            target,
+            &param_buffer,
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -888,7 +925,7 @@ impl Sim {
                 label: Some("clear_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.clear_pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups((w + 15) / 16, (h + 15) / 16, 1);
         }
@@ -904,6 +941,31 @@ impl Sim {
         x1: u32,
         y1: u32,
         path: std::path::PathBuf,
+        palette: Palette,
+    ) {
+        self.request_readback(x0, y0, x1, y1, Some(path), palette);
+    }
+
+    /// Like `request_selection_png`, but yields raw RGBA pixels (for the
+    /// clipboard) instead of writing a file.
+    pub fn request_selection_clipboard(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        palette: Palette,
+    ) {
+        self.request_readback(x0, y0, x1, y1, None, palette);
+    }
+
+    fn request_readback(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        path: Option<std::path::PathBuf>,
         palette: Palette,
     ) {
         if self.png_readback.is_some() {
@@ -974,8 +1036,8 @@ impl Sim {
         });
     }
 
-    /// Returns the saved path if a pending PNG readback completed.
-    pub fn poll_png(&mut self) -> Option<Result<std::path::PathBuf, String>> {
+    /// Returns the outcome if a pending readback completed.
+    pub fn poll_png(&mut self) -> Option<Result<ReadbackResult, String>> {
         let rb = self.png_readback.take()?;
         self.device.poll(wgpu::Maintain::Poll);
         if !rb.mapped.load(Ordering::Relaxed) {
@@ -1111,7 +1173,7 @@ fn write_png(
     writer.write_image_data(rgba).map_err(|e| e.to_string())
 }
 
-fn write_png_from_readback(rb: &PngReadback) -> Result<std::path::PathBuf, String> {
+fn readback_rgba(rb: &PngReadback) -> Vec<u8> {
     let view = rb.buffer.slice(..).get_mapped_range();
     let data: &[u32] = bytemuck::cast_slice(&view);
     let w = rb.width as usize;
@@ -1131,8 +1193,22 @@ fn write_png_from_readback(rb: &PngReadback) -> Result<std::path::PathBuf, Strin
     }
     drop(view);
     rb.buffer.unmap();
-    write_png(&rb.path, w as u32, h as u32, &rgba)?;
-    Ok(rb.path.clone())
+    rgba
+}
+
+fn write_png_from_readback(rb: &PngReadback) -> Result<ReadbackResult, String> {
+    let rgba = readback_rgba(rb);
+    match &rb.path {
+        Some(path) => {
+            write_png(path, rb.width, rb.height, &rgba)?;
+            Ok(ReadbackResult::Saved(path.clone()))
+        }
+        None => Ok(ReadbackResult::Image {
+            width: rb.width,
+            height: rb.height,
+            rgba,
+        }),
+    }
 }
 
 fn create_state_texture(
@@ -1235,6 +1311,28 @@ fn make_compute_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: rule.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn make_clear_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    target: &wgpu::TextureView,
+    param_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("clear_bind_group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(target),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: param_buffer.as_entire_binding(),
             },
         ],
     })

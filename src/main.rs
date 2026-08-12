@@ -13,7 +13,7 @@ use crate::palette::presets as palette_presets;
 use crate::patterns::{Pattern, presets as pattern_presets};
 use crate::rules::Rule;
 use crate::script::{ScriptEngine, ScriptResult};
-use crate::sim::Sim;
+use crate::sim::{ReadbackResult, Sim};
 
 fn main() {
     // Force X11 so fullscreen is truly borderless (Wayland often keeps a thin frame).
@@ -451,32 +451,43 @@ impl App {
     fn clear_outside_selection(&mut self) {
         let Some(sel) = self.selection else { return };
         self.flush_edits();
+        let Some((x0, y0, x1, y1)) = self.selection_rect_cells(sel) else {
+            return;
+        };
+        let cb = self.sim.lock().unwrap().clear_outside(x0, y0, x1, y1);
+        self.sim.lock().unwrap().submit(vec![cb]);
+    }
+
+    fn clear_inside_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.flush_edits();
+        let Some((x0, y0, x1, y1)) = self.selection_rect_cells(sel) else {
+            return;
+        };
+        let cb = self.sim.lock().unwrap().clear_inside(x0, y0, x1, y1);
+        self.sim.lock().unwrap().submit(vec![cb]);
+    }
+
+    /// Clamp a selection rectangle to the world bounds as inclusive cell coords.
+    fn selection_rect_cells(&self, sel: [i32; 4]) -> Option<(u32, u32, u32, u32)> {
         let (w, h) = self.sim.lock().unwrap().size;
         let x0 = sel[0].clamp(0, w as i32 - 1) as u32;
         let y0 = sel[1].clamp(0, h as i32 - 1) as u32;
         let x1 = sel[2].clamp(0, w as i32 - 1) as u32;
         let y1 = sel[3].clamp(0, h as i32 - 1) as u32;
         if x1 < x0 || y1 < y0 {
-            return;
+            return None;
         }
-        let cb = self.sim.lock().unwrap().clear_outside(x0, y0, x1, y1);
-        self.sim.lock().unwrap().submit(vec![cb]);
+        Some((x0, y0, x1, y1))
     }
 
     fn save_selection_png(&mut self) {
         self.flush_edits();
-        let (w, h) = self.sim.lock().unwrap().size;
-        let (x0, y0, x1, y1) = match self.selection {
-            Some(sel) => (sel[0], sel[1], sel[2], sel[3]),
-            None => self.visible_cells(self.world_rect),
+        let cells = match self.selection {
+            Some(sel) => self.selection_rect_cells(sel),
+            None => self.selection_rect_cells(self.visible_cells(self.world_rect)),
         };
-        let x0 = x0.clamp(0, w as i32 - 1) as u32;
-        let y0 = y0.clamp(0, h as i32 - 1) as u32;
-        let x1 = x1.clamp(0, w as i32 - 1) as u32;
-        let y1 = y1.clamp(0, h as i32 - 1) as u32;
-        if x1 < x0 || y1 < y0 {
-            return;
-        }
+        let Some((x0, y0, x1, y1)) = cells else { return };
         let mut sim = self.sim.lock().unwrap();
         if sim.png_readback.is_some() {
             self.export_status = Some(("Export already in progress".to_string(), Instant::now()));
@@ -493,7 +504,42 @@ impl App {
         self.export_status = Some((label, Instant::now()));
     }
 
-    fn visible_cells(&self, rect: Rect) -> (i32, i32, i32, i32) {
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.flush_edits();
+        let Some((x0, y0, x1, y1)) = self.selection_rect_cells(sel) else {
+            return;
+        };
+        let mut sim = self.sim.lock().unwrap();
+        if sim.png_readback.is_some() {
+            self.export_status = Some(("Export already in progress".to_string(), Instant::now()));
+            return;
+        }
+        let palette = sim.palette.clone();
+        sim.request_selection_clipboard(x0, y0, x1, y1, palette);
+        self.export_status = Some(("Copying selection…".to_string(), Instant::now()));
+    }
+
+    fn select_visible(&mut self) {
+        self.selection_start = None;
+        self.selection_current = None;
+        self.selection_edge = None;
+        self.selection = Some(self.visible_cells(self.world_rect));
+    }
+
+    fn select_world(&mut self) {
+        self.selection_start = None;
+        self.selection_current = None;
+        self.selection_edge = None;
+        let (w, h) = self.sim.lock().unwrap().size;
+        if w == 0 || h == 0 {
+            self.selection = None;
+            return;
+        }
+        self.selection = Some([0, 0, w as i32 - 1, h as i32 - 1]);
+    }
+
+    fn visible_cells(&self, rect: Rect) -> [i32; 4] {
         let (w, h) = self.sim.lock().unwrap().size;
         let vp = rect.size() * 0.5;
         let world = |pos: egui::Pos2| -> (f32, f32) {
@@ -509,7 +555,7 @@ impl App {
         let y0 = (ay.floor() as i32).clamp(0, h as i32 - 1);
         let x1 = (bx.floor() as i32).clamp(0, w as i32 - 1);
         let y1 = (by.floor() as i32).clamp(0, h as i32 - 1);
-        (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+        [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
     }
 
     fn draw_selection(&self, ui: &egui::Ui, rect: Rect) {
@@ -585,7 +631,7 @@ impl App {
         if self.selection.is_some() {
             let cw = (screen_rect.width() / self.scale).round() as u64;
             let ch = (screen_rect.height() / self.scale).round() as u64;
-            let text = format!("{cw}×{ch}  ·  Y clear  ·  Ctrl+S save  ·  drag edges  ·  Esc clear");
+            let text = format!("{cw}×{ch}  ·  Y clear out  ·  C clear in  ·  Ctrl+C copy  ·  Ctrl+S save  ·  Ctrl+A view  ·  drag edges  ·  Esc");
             let galley = painter.layout_no_wrap(
                 text,
                 egui::FontId::monospace(11.0),
@@ -715,10 +761,52 @@ impl eframe::App for App {
                 }
             }
 
-            // Finish any pending PNG export.
+            // Selection and palette shortcuts, gated so they never fire while a
+            // text field has focus (e.g. typing a rule or script).
+            if !ctx.wants_keyboard_input() {
+                let (c_pressed, ctrl_c, ctrl_a, shift_ctrl_a, left, right) = ctx.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::C)
+                            && !i.modifiers.command
+                            && !i.modifiers.shift,
+                        i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C),
+                        i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::A),
+                        i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::A),
+                        i.key_pressed(egui::Key::ArrowLeft),
+                        i.key_pressed(egui::Key::ArrowRight),
+                    )
+                });
+                if !self.running {
+                    if c_pressed {
+                        self.clear_inside_selection();
+                    }
+                    if ctrl_c {
+                        self.copy_selection_to_clipboard();
+                    }
+                    if ctrl_a {
+                        self.select_visible();
+                    }
+                    if shift_ctrl_a {
+                        self.select_world();
+                    }
+                }
+                if left || right {
+                    let n = palette_presets().len();
+                    if n > 0 {
+                        let delta = if right { 1 } else { n - 1 };
+                        self.selected_palette_idx = (self.selected_palette_idx + delta) % n;
+                        self.sim
+                            .lock()
+                            .unwrap()
+                            .set_palette(&palette_presets()[self.selected_palette_idx]);
+                    }
+                }
+            }
+
+            // Finish any pending PNG export / clipboard copy.
             if let Some(result) = self.sim.lock().unwrap().poll_png() {
                 match result {
-                    Ok(path) => {
+                    Ok(ReadbackResult::Saved(path)) => {
                         self.export_status =
                             Some((format!("Saved {}", path.display()), Instant::now()));
                         if let Some(name) = path.file_name() {
@@ -726,6 +814,17 @@ impl eframe::App for App {
                                 println!("{name}");
                             }
                         }
+                    }
+                    Ok(ReadbackResult::Image {
+                        width,
+                        height,
+                        rgba,
+                    }) => {
+                        let status = match copy_image_to_clipboard(width, height, rgba) {
+                            Ok(()) => "Copied selection to clipboard".to_string(),
+                            Err(e) => format!("Copy failed: {e}"),
+                        };
+                        self.export_status = Some((status, Instant::now()));
                     }
                     Err(e) => {
                         self.export_status =
@@ -917,10 +1016,11 @@ impl eframe::App for App {
                     });
 
                     ui.separator();
-                    ui.label("Shortcuts: Space = run/pause  F1 = UI  F = fullscreen  1-5 = flip %");
-                    ui.label("Up/Down = step count   Wheel = zoom   middle/right-drag = pan");
-                    ui.label("Ctrl+drag = select area   drag edges = resize   Y = clear outside");
-                    ui.label("Ctrl+S = export (selection or fullscreen)   Esc/click outside = clear selection   Q = quit");
+                    ui.label("Shortcuts: Space = run/pause  F1 = UI  F = fullscreen  1-5 = flip %  Q = quit");
+                    ui.label("Up/Down = step count  Left/Right = palette  Wheel = zoom  middle/right-drag = pan");
+                    ui.label("Ctrl+drag = select area   drag edges = resize   Y = clear outside   C = clear inside");
+                    ui.label("Ctrl+C = copy   Ctrl+S = export (selection or fullscreen)");
+                    ui.label("Ctrl+A = select view   Shift+Ctrl+A = select whole world   Esc / click outside = clear selection");
                 });
         }
 
@@ -1165,6 +1265,17 @@ impl eframe::egui_wgpu::CallbackTrait for GolCallback {
     ) {
         self.sim.lock().unwrap().render(render_pass);
     }
+}
+
+fn copy_image_to_clipboard(width: u32, height: u32, rgba: Vec<u8>) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: std::borrow::Cow::Owned(rgba),
+        })
+        .map_err(|e| e.to_string())
 }
 
 fn next_download_path() -> std::path::PathBuf {
